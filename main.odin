@@ -34,17 +34,22 @@ PlayerAnimationState :: enum {
 	RUNNING_S,
 	RUNNING_A,
 	RUNNING_D,
+	DEACTIVE,
+	ACTIVE,
 }
 
 TileType :: enum {
 	WALL,
 	GROUND,
 	SURGROUND,
+	PROPS,
 }
 
 EntityType :: enum {
 	PLAYER,
 	MONSTER,
+	ROPE,
+	FIREPIT,
 }
 
 AnimationPlayer :: struct {
@@ -60,8 +65,17 @@ Entity :: struct {
 	animationPlayer: ^AnimationPlayer,
 	texture_id:      rl.Texture2D,
 	type:            EntityType,
+
+	//players
 	movedir:         rl.Vector2,
 	health:          int,
+
+	//rope
+	pickable:        bool,
+	already_picked:  bool,
+
+	//fire
+	fire_active:     bool,
 }
 
 TileSet :: struct {
@@ -71,10 +85,16 @@ TileSet :: struct {
 }
 
 LevelData :: struct {
-	level_id:                int,
-	player_start_position:   rl.Vector2,
-	lift_trigger_pos:        rl.Vector2,
-	lift_trigger_dimentions: rl.Vector2,
+	level_id:                  int,
+	player_start_position:     rl.Vector2,
+	lift_trigger_pos:          rl.Vector2,
+	lift_trigger_dimentions:   rl.Vector2,
+	//pickable ropes	
+	rope_count_exists:         int,
+	current_picked_rope_count: int,
+	//
+	locked:                    bool,
+	won:                       bool,
 }
 
 State :: struct {
@@ -87,6 +107,7 @@ State :: struct {
 	tile_width:               int,
 	tile_height:              int,
 	tile_data:                []int,
+	prop_data:                []int,
 	camera:                   rl.Camera2D,
 	render_texture:           rl.RenderTexture2D,
 	fullscreen:               bool,
@@ -100,6 +121,11 @@ State :: struct {
 	master_volume:            f32,
 	is_muted:                 bool,
 	audio_device_initialized: bool,
+	//enemies+firepit+rope
+	texture_efr:              rl.Texture2D,
+	enemies:                  [dynamic]Entity,
+	ropes:                    [dynamic]Entity,
+	firepits:                 [dynamic]Entity,
 }
 
 TiledLayerObjectProperties :: struct {
@@ -110,8 +136,8 @@ TiledLayerObjectProperties :: struct {
 
 TiledLayerObjects :: struct {
 	id:         int,
-	height:     int,
-	width:      int,
+	height:     f32,
+	width:      f32,
 	name:       string,
 	properties: []TiledLayerObjectProperties,
 	rotation:   int,
@@ -192,29 +218,37 @@ handle_input :: proc() {
 	switch state.current_state {
 	case .MAINMENU:
 		if rl.IsKeyPressed(.SPACE) {
-			change_level(0) // Start from level 0
+			change_level(1) // Start from level 0
 		}
 
 	case .LEVEL0, .LEVEL1, .LEVEL2, .LEVEL3, .LEVEL4:
 		// Player movement controls
+		new_pos := state.player.position
+
 		if rl.IsKeyDown(.W) || rl.IsKeyDown(.UP) {
-			state.player.movedir = {0, -1}
-			state.player.position.y += state.player.movedir.y * PLAYER_MOVE_SPEED * dt
+			new_pos.y -= PLAYER_MOVE_SPEED * dt
 			state.player.animationPlayer.state = .RUNNING_W
 		} else if rl.IsKeyDown(.S) || rl.IsKeyDown(.DOWN) {
-			state.player.movedir = {0, 1}
-			state.player.position.y += state.player.movedir.y * PLAYER_MOVE_SPEED * dt
+			new_pos.y += PLAYER_MOVE_SPEED * dt
 			state.player.animationPlayer.state = .RUNNING_S
 		} else if rl.IsKeyDown(.D) || rl.IsKeyDown(.RIGHT) {
-			state.player.movedir = {1, 0}
-			state.player.position.x += state.player.movedir.x * PLAYER_MOVE_SPEED * dt
+			new_pos.x += PLAYER_MOVE_SPEED * dt
 			state.player.animationPlayer.state = .RUNNING_D
 		} else if rl.IsKeyDown(.A) || rl.IsKeyDown(.LEFT) {
-			state.player.movedir = {-1, 0}
-			state.player.position.x += state.player.movedir.x * PLAYER_MOVE_SPEED * dt
+			new_pos.x -= PLAYER_MOVE_SPEED * dt
 			state.player.animationPlayer.state = .RUNNING_A
 		} else {
 			state.player.animationPlayer.state = .IDLE
+		}
+
+		// Only update position if new position is not blocked
+		if !is_tile_blocking(new_pos) {
+			state.player.position = new_pos
+			// Update movedir only if movement was successful
+			state.player.movedir = {
+				new_pos.x - state.player.position.x,
+				new_pos.y - state.player.position.y,
+			}
 		}
 
 		// Pause game
@@ -285,7 +319,26 @@ init_game :: proc() {
 	state.player.animationPlayer.state = .IDLE
 	state.player.health = PLAYER_HEALTH
 
+	state.texture_efr = rl.LoadTexture("assets/fire-enemy-rope.png")
+
+	enemy_animation_player := new(AnimationPlayer)
+	enemy_animation_player.state = .IDLE
+	enemy_animation_player.frame = 0
+	enemy_animation_player.timer = 0
+	enemy_animation_player.frame_count = 3
+	enemy_animation_player.frame_duration = 0.1
+	firepit_animation_player := new(AnimationPlayer)
+	firepit_animation_player.state = .DEACTIVE
+	firepit_animation_player.frame = 0
+	firepit_animation_player.timer = 0
+	firepit_animation_player.frame_count = 4
+	firepit_animation_player.frame_duration = 0.1
+
 	if parsed_json, ok := os.read_entire_file("assets/map.json", context.temp_allocator); ok {
+		// if err := json.unmarshal(parsed_json, &state.map_json); err != nil {
+		// 	fmt.eprintln("Failed to unmarshal JSON:", err)
+		// 	os.exit(1) // Exit with error code
+		// }
 
 		if json.unmarshal(parsed_json, &state.map_json) == nil {
 
@@ -294,14 +347,19 @@ init_game :: proc() {
 			state.map_width = state.map_json.width
 			state.map_height = state.map_json.height
 
-			layer := state.map_json.layers[0]
-
-			state.tile_data = layer.data
+			for layer in state.map_json.layers {
+				if layer.id == 1 {
+					state.tile_data = layer.data
+				} else if layer.id == 5 {
+					state.prop_data = layer.data
+				}
+			}
 
 			walls_texture := rl.LoadTexture("assets/walls.png")
 			grounds_texture := rl.LoadTexture("assets/grounds.png")
 			surgrounds_texture := rl.LoadTexture("assets/surground.png")
-			state.tilesets = make([]TileSet, 3, context.allocator)
+			props_texture := rl.LoadTexture("assets/props.png")
+			state.tilesets = make([]TileSet, 4, context.allocator)
 			state.tilesets[0] = TileSet {
 				first_gid = 1,
 				texture   = walls_texture,
@@ -316,6 +374,11 @@ init_game :: proc() {
 				first_gid = 433,
 				texture   = surgrounds_texture,
 				tileType  = .SURGROUND,
+			}
+			state.tilesets[3] = TileSet {
+				first_gid = 615,
+				texture   = props_texture,
+				tileType  = .PROPS,
 			}
 		} else {
 			fmt.println("Failed to unmarshal JSON")
@@ -351,8 +414,62 @@ init_game :: proc() {
 					}
 				}
 			}
+		case "rope":
+			for obj in layer.objects {
+				if obj.properties != nil && len(obj.properties) > 0 {
+					level_id := obj.properties[0].value
+					if level_id >= 0 && level_id < len(state.levels) {
+						state.levels[level_id].rope_count_exists += 1
+						rope := Entity {
+							position       = {obj.x, obj.y},
+							type           = .ROPE,
+							pickable       = true,
+							already_picked = false,
+							texture_id     = state.texture_efr, // Your rope texture
+						}
+						append(&state.ropes, rope)
+					}
+				}
+			}
+		case "enemy":
+			for obj in layer.objects {
+				if obj.properties != nil && len(obj.properties) > 0 {
+					level_id := obj.properties[0].value
+					if level_id >= 0 && level_id < len(state.levels) {
+						enemy := Entity {
+							position        = {obj.x, obj.y},
+							type            = .MONSTER,
+							texture_id      = state.texture_efr, // Your rope texture
+							movedir         = {1, 0},
+							animationPlayer = enemy_animation_player,
+						}
+						append(&state.enemies, enemy)
+					}
+				}
+			}
+		case "firepit":
+			for obj in layer.objects {
+				if obj.properties != nil && len(obj.properties) > 0 {
+					level_id := obj.properties[0].value
+					if level_id >= 0 && level_id < len(state.levels) {
+						firepit := Entity {
+							position        = {obj.x, obj.y},
+							type            = .FIREPIT,
+							texture_id      = state.texture_efr,
+							fire_active     = false,
+							animationPlayer = firepit_animation_player,
+						}
+						append(&state.firepits, firepit)
+					}
+				}
+			}
 		}
 	}
+
+	//sounds
+
+	//enemies
+
 }
 
 draw_game :: proc() {
@@ -405,6 +522,48 @@ draw_game :: proc() {
 						rl.DrawTextureRec(tileset.texture, src, dest, rl.WHITE)
 					}
 				}
+				//props tile layer
+				for y in 0 ..< state.map_height {
+					for x in 0 ..< state.map_width {
+						idx := y * state.map_width + x
+						gid := state.prop_data[idx]
+						if gid == 0 {
+							continue
+						}
+
+						// Find the appropriate tileset
+						tileset: ^TileSet = nil
+						best_gid := -1
+						for &ts in state.tilesets {
+							if ts.first_gid <= gid && ts.first_gid > best_gid {
+								tileset = &ts
+								best_gid = ts.first_gid
+							}
+						}
+
+						if tileset == nil {
+							continue
+						}
+
+						local_id := gid - tileset.first_gid
+						tileset_columns := int(tileset.texture.width) / state.tile_width
+						tileset_rows := int(tileset.texture.height) / state.tile_height
+
+						if local_id < 0 || local_id >= tileset_columns * tileset_rows {
+							continue
+						}
+
+						src := rl.Rectangle {
+							f32((local_id % tileset_columns) * state.tile_width),
+							f32((local_id / tileset_columns) * state.tile_height),
+							f32(state.tile_width),
+							f32(state.tile_height),
+						}
+						dest := rl.Vector2{f32(x * state.tile_width), f32(y * state.tile_height)}
+
+						rl.DrawTextureRec(tileset.texture, src, dest, rl.WHITE)
+					}
+				}
 				{
 					anim := state.player.animationPlayer
 
@@ -420,7 +579,7 @@ draw_game :: proc() {
 					frame_y: f32 = 0 // Default row for IDLE
 
 					// Select animation row based on state
-					switch anim.state {
+					#partial switch anim.state {
 					case .RUNNING_W:
 						anim.frame_count = 4
 						frame_y = f32(2 * TILE_SIZE)
@@ -452,6 +611,38 @@ draw_game :: proc() {
 						rl.WHITE,
 					)
 				}
+				// In draw_game() after BeginMode2D()
+				if ODIN_DEBUG {
+					// Draw player collision box
+					rl.DrawRectangleLinesEx(
+						rl.Rectangle {
+							state.player.position.x + 3,
+							state.player.position.y + 3,
+							f32(state.tile_width - 6),
+							f32(state.tile_height - 6),
+						},
+						1,
+						rl.RED,
+					)
+
+					// Draw blocking tiles
+					for y in 0 ..< state.map_height {
+						for x in 0 ..< state.map_width {
+							idx := y * state.map_width + x
+							gid := state.tile_data[idx]
+							gid2 := state.prop_data[idx]
+							if gid <= 225 || (gid2 > 615) {
+								rl.DrawRectangleLines(
+									i32(x * state.tile_width),
+									i32(y * state.tile_height),
+									i32(state.tile_width),
+									i32(state.tile_height),
+									rl.ColorAlpha(rl.RED, 0.5),
+								)
+							}
+						}
+					}
+				}
 
 			}
 			rl.EndMode2D()
@@ -460,7 +651,6 @@ draw_game :: proc() {
 		#partial switch state.current_state {
 		case .MAINMENU:
 			draw_main_menu()
-
 		case .PAUSED:
 			draw_pause_menu()
 		case .GAMEOVER:
@@ -536,4 +726,36 @@ draw_game_over :: proc() {
 	rl.DrawText("GAME OVER", GAME_WIDTH / 2 - 100, GAME_HEIGHT / 2 - 40, 40, rl.RED)
 	rl.DrawText("Press SPACE to restart", GAME_WIDTH / 2 - 120, GAME_HEIGHT / 2 + 20, 20, rl.WHITE)
 	rl.DrawText("Press M for main menu", GAME_WIDTH / 2 - 120, GAME_HEIGHT / 2 + 50, 20, rl.WHITE)
+}
+
+is_tile_blocking :: proc(pos: rl.Vector2) -> bool {
+	// Check all four corners of the player's hitbox
+	points := []rl.Vector2 {
+		{pos.x + 3, pos.y + 3}, // top-left
+		{(pos.x + 3) + 10, (pos.y + 3)}, // top-right
+		{(pos.x + 3), (pos.y + 3) + 10}, // bottom-left
+		{(pos.x + 3) + 10, (pos.y + 3) + 10}, // bottom-right
+	}
+
+
+	for point in points {
+		tile_x := int(point.x) / state.tile_width
+		tile_y := int(point.y) / state.tile_height
+
+		// Check bounds
+		if tile_x < 0 || tile_x >= state.map_width || tile_y < 0 || tile_y >= state.map_height {
+			return true
+		}
+
+		// Get tile data
+		idx := tile_y * state.map_width + tile_x
+		gid := state.tile_data[idx]
+		gid2 := state.prop_data[idx]
+
+		// Check if tile is blocking
+		if gid <= 225 || (gid2 > 615) {
+			return true
+		}
+	}
+	return false
 }
