@@ -1,5 +1,5 @@
 add a shader for light 
-HUD
+HUD -> to show user interations
 UI messages
 Enemy load
 Take damage when light is out
@@ -8,3 +8,5 @@ Add sounds
 
 
 level change to next one after each level ropes collected
+
+

@@ -61,21 +61,22 @@ AnimationPlayer :: struct {
 }
 
 Entity :: struct {
-	position:        rl.Vector2,
-	animationPlayer: ^AnimationPlayer,
-	texture_id:      rl.Texture2D,
-	type:            EntityType,
+	position:             rl.Vector2,
+	animationPlayer:      ^AnimationPlayer,
+	texture_id:           rl.Texture2D,
+	type:                 EntityType,
 
 	//players
-	movedir:         rl.Vector2,
-	health:          int,
+	movedir:              rl.Vector2,
+	health:               int,
 
 	//rope
-	pickable:        bool,
-	already_picked:  bool,
+	pickable:             bool,
+	already_picked:       bool,
 
 	//fire
-	fire_active:     bool,
+	fire_active:          bool,
+	show_interact_prompt: bool,
 }
 
 TileSet :: struct {
@@ -126,6 +127,20 @@ State :: struct {
 	enemies:                  [dynamic]Entity,
 	ropes:                    [dynamic]Entity,
 	firepits:                 [dynamic]Entity,
+	show_firepit_prompt:      bool,
+	nearest_firepit_index:    int,
+	//light shader
+	light_shader:             rl.Shader,
+	light_pos_loc:            i32,
+	light_radius_loc:         i32,
+	screen_size_loc:          i32,
+	light_radius:             f32,
+	max_light_radius:         f32,
+	light_timer:              f32,
+	light_duration:           f32,
+	camera_pos_loc:           i32,
+	player_pos_loc:           i32,
+	render_size_loc:          i32,
 }
 
 TiledLayerObjectProperties :: struct {
@@ -256,6 +271,8 @@ handle_input :: proc() {
 			state.current_state = .PAUSED
 		}
 
+		check_firepit_interaction()
+
 	case .PAUSED:
 		if rl.IsKeyPressed(.P) || rl.IsKeyPressed(.SPACE) {
 			if state.last_level >= 0 && state.last_level < 5 {
@@ -295,6 +312,7 @@ update_game :: proc() {
 
 	state.camera.target.x = math.clamp(state.camera.target.x, GAME_WIDTH / 2, max_x)
 	state.camera.target.y = math.clamp(state.camera.target.y, GAME_HEIGHT / 2, max_y)
+	update_firepits()
 }
 
 init_game :: proc() {
@@ -314,25 +332,13 @@ init_game :: proc() {
 	state.player.animationPlayer = new(AnimationPlayer)
 	state.player.animationPlayer.frame = 0
 	state.player.animationPlayer.timer = 0
-	state.player.animationPlayer.frame_count = 4
+	state.player.animationPlayer.frame_count = 3
 	state.player.animationPlayer.frame_duration = 0.1
 	state.player.animationPlayer.state = .IDLE
 	state.player.health = PLAYER_HEALTH
 
 	state.texture_efr = rl.LoadTexture("assets/fire-enemy-rope.png")
 
-	enemy_animation_player := new(AnimationPlayer)
-	enemy_animation_player.state = .IDLE
-	enemy_animation_player.frame = 0
-	enemy_animation_player.timer = 0
-	enemy_animation_player.frame_count = 3
-	enemy_animation_player.frame_duration = 0.1
-	firepit_animation_player := new(AnimationPlayer)
-	firepit_animation_player.state = .DEACTIVE
-	firepit_animation_player.frame = 0
-	firepit_animation_player.timer = 0
-	firepit_animation_player.frame_count = 4
-	firepit_animation_player.frame_duration = 0.1
 
 	if parsed_json, ok := os.read_entire_file("assets/map.json", context.temp_allocator); ok {
 		// if err := json.unmarshal(parsed_json, &state.map_json); err != nil {
@@ -436,6 +442,12 @@ init_game :: proc() {
 				if obj.properties != nil && len(obj.properties) > 0 {
 					level_id := obj.properties[0].value
 					if level_id >= 0 && level_id < len(state.levels) {
+						enemy_animation_player := new(AnimationPlayer)
+						enemy_animation_player.state = .IDLE
+						enemy_animation_player.frame = 3
+						enemy_animation_player.timer = 0
+						enemy_animation_player.frame_count = 3
+						enemy_animation_player.frame_duration = 0.5
 						enemy := Entity {
 							position        = {obj.x, obj.y},
 							type            = .MONSTER,
@@ -452,6 +464,12 @@ init_game :: proc() {
 				if obj.properties != nil && len(obj.properties) > 0 {
 					level_id := obj.properties[0].value
 					if level_id >= 0 && level_id < len(state.levels) {
+						firepit_animation_player := new(AnimationPlayer)
+						firepit_animation_player.state = .DEACTIVE
+						firepit_animation_player.frame = 0
+						firepit_animation_player.timer = 0
+						firepit_animation_player.frame_count = 1
+						firepit_animation_player.frame_duration = 0.5
 						firepit := Entity {
 							position        = {obj.x, obj.y},
 							type            = .FIREPIT,
@@ -465,6 +483,21 @@ init_game :: proc() {
 			}
 		}
 	}
+
+	//light shader
+	state.light_shader = rl.LoadShader("", "lighting.fs")
+
+
+	state.player_pos_loc = rl.GetShaderLocation(state.light_shader, "playerPos")
+	state.light_radius_loc = rl.GetShaderLocation(state.light_shader, "lightRadius")
+	state.render_size_loc = rl.GetShaderLocation(state.light_shader, "renderSize")
+	// Set screen size once
+	screen_size := [2]f32{f32(GAME_WIDTH), f32(GAME_HEIGHT)}
+	rl.SetShaderValue(state.light_shader, state.screen_size_loc, &screen_size, .VEC2)
+	state.max_light_radius = 10.0
+	state.light_radius = state.max_light_radius
+	state.light_duration = 10.0 // Seconds until light fades
+	state.light_timer = state.light_duration
 
 	//sounds
 
@@ -564,6 +597,7 @@ draw_game :: proc() {
 						rl.DrawTextureRec(tileset.texture, src, dest, rl.WHITE)
 					}
 				}
+				//animation player
 				{
 					anim := state.player.animationPlayer
 
@@ -611,40 +645,133 @@ draw_game :: proc() {
 						rl.WHITE,
 					)
 				}
-				// In draw_game() after BeginMode2D()
-				if ODIN_DEBUG {
-					// Draw player collision box
-					rl.DrawRectangleLinesEx(
-						rl.Rectangle {
-							state.player.position.x + 3,
-							state.player.position.y + 3,
-							f32(state.tile_width - 6),
-							f32(state.tile_height - 6),
-						},
-						1,
-						rl.RED,
-					)
+				//animations enemy
+				{
+					for enemy in state.enemies {
+						anim := enemy.animationPlayer
 
-					// Draw blocking tiles
-					for y in 0 ..< state.map_height {
-						for x in 0 ..< state.map_width {
-							idx := y * state.map_width + x
-							gid := state.tile_data[idx]
-							gid2 := state.prop_data[idx]
-							if gid <= 225 || (gid2 > 615) {
-								rl.DrawRectangleLines(
-									i32(x * state.tile_width),
-									i32(y * state.tile_height),
-									i32(state.tile_width),
-									i32(state.tile_height),
-									rl.ColorAlpha(rl.RED, 0.5),
-								)
+						// Update animation timer
+						anim.timer += rl.GetFrameTime()
+						if anim.timer >= anim.frame_duration {
+							anim.timer = 0
+							anim.frame = (anim.frame + 1) % anim.frame_count
+						}
+
+						frames_per_row := state.texture_efr.width / TILE_SIZE
+						frame_col := i32(anim.frame) % frames_per_row
+						frame_row := 2 // 3rd row (0-indexed)
+
+						frame_x := f32(frame_col * TILE_SIZE)
+						frame_y := f32(frame_row * TILE_SIZE)
+
+						e_src := rl.Rectangle{frame_x, frame_y, f32(TILE_SIZE), f32(TILE_SIZE)}
+
+						e_pixel_pos := rl.Vector2{enemy.position.x, enemy.position.y}
+
+						// Optional: Flip texture based on movement direction
+						flip := enemy.movedir.x < 0 ? -1.0 : 1.0
+						rl.DrawTextureRec(
+							state.texture_efr,
+							e_src,
+							e_pixel_pos,
+							rl.ColorAlpha(rl.WHITE, flip < 0 ? 1.0 : 1.0), // Could add flip logic here
+						)
+					}
+
+				}
+				//animations firepit
+				{
+					for fp in state.firepits {
+						anim := fp.animationPlayer
+						anim.timer += rl.GetFrameTime()
+
+						frames_per_row := state.texture_efr.width / TILE_SIZE
+						frame_col: i32
+						frame_row: i32 = 1 // Second row (0-indexed) for firepits
+						frame_x: f32
+						frame_y: f32
+
+						#partial switch anim.state {
+						case .ACTIVE:
+							anim.frame_count = 5 // Total frames in row
+							// Skip first frame (start at frame 1 instead of 0)
+							adjusted_frame := anim.frame + 1
+							if adjusted_frame >= anim.frame_count {
+								adjusted_frame = 1 // Skip frame 0 when wrapping around
 							}
+							frame_col = i32(adjusted_frame) % frames_per_row
+							frame_y = f32(frame_row * TILE_SIZE)
+
+						case .DEACTIVE:
+							anim.frame_count = 1
+							frame_col = 0 // First frame
+							frame_y = f32(frame_row * TILE_SIZE) // Same row but only first frame
+						}
+
+						// Update animation frame
+						if anim.timer >= anim.frame_duration {
+							anim.timer = 0
+							anim.frame = (anim.frame + 1) % anim.frame_count
+						}
+
+						frame_x = f32(frame_col * TILE_SIZE)
+						f_src := rl.Rectangle{frame_x, frame_y, f32(TILE_SIZE), f32(TILE_SIZE)}
+						f_pixel_pos := rl.Vector2{fp.position.x, fp.position.y}
+
+						// Draw base firepit
+						rl.DrawTextureRec(state.texture_efr, f_src, f_pixel_pos, rl.WHITE)
+
+						// Add glowing effect for active firepits
+						if anim.state == .ACTIVE {
+							rl.BeginBlendMode(.ADDITIVE)
+							glow_alpha := 0.6 + 0.2 * math.sin(rl.GetTime() * 3) // Pulsing effect
+							rl.DrawTextureRec(
+								state.texture_efr,
+								f_src,
+								f_pixel_pos,
+								rl.ColorAlpha(rl.ORANGE, f32(glow_alpha)),
+							)
+							rl.EndBlendMode()
 						}
 					}
 				}
+				draw_firepits_tooltip()
+
+				// In draw_game() after BeginMode2D()
+				// if ODIN_DEBUG {
+				// 	// Draw player collision box
+				// 	rl.DrawRectangleLinesEx(
+				// 		rl.Rectangle {
+				// 			state.player.position.x + 3,
+				// 			state.player.position.y + 3,
+				// 			f32(state.tile_width - 6),
+				// 			f32(state.tile_height - 6),
+				// 		},
+				// 		1,
+				// 		rl.RED,
+				// 	)
+				//
+				// 	// Draw blocking tiles
+				// 	for y in 0 ..< state.map_height {
+				// 		for x in 0 ..< state.map_width {
+				// 			idx := y * state.map_width + x
+				// 			gid := state.tile_data[idx]
+				// 			gid2 := state.prop_data[idx]
+				// 			if gid <= 225 || (gid2 > 615) {
+				// 				rl.DrawRectangleLines(
+				// 					i32(x * state.tile_width),
+				// 					i32(y * state.tile_height),
+				// 					i32(state.tile_width),
+				// 					i32(state.tile_height),
+				// 					rl.ColorAlpha(rl.RED, 0.5),
+				// 				)
+				// 			}
+				// 		}
+				// 	}
+				// }
 
 			}
+
 			rl.EndMode2D()
 		}
 		// Draw state-specific overlays
@@ -658,6 +785,9 @@ draw_game :: proc() {
 		}
 	}
 	rl.EndTextureMode()
+
+	// 3. Now draw your game scene with blending
+
 
 	// Draw render texture to screen, scaled properly
 	rl.BeginDrawing()
@@ -677,6 +807,68 @@ draw_game :: proc() {
 			GAME_HEIGHT * scale,
 		}
 
+		rl.BeginShaderMode(state.light_shader)
+		{
+			// Set shader uniforms
+			//player_pos := [2]f32{state.player.position.x, state.player.position.y}
+			render_size := [2]f32{f32(GAME_WIDTH), f32(GAME_HEIGHT)}
+			player_world_pos := state.player.position
+			// Correct calculation of player position in screen space
+			screen_pos := [2]f32 {
+				(player_world_pos.x - state.camera.target.x) + (f32(rl.GetScreenWidth()) * 0.5),
+				(player_world_pos.y - state.camera.target.y) + (f32(rl.GetScreenHeight()) * 0.5),
+			}
+
+			rl.SetShaderValue(
+				state.light_shader,
+				state.player_pos_loc,
+				&state.player.position,
+				.VEC2,
+			)
+			rl.SetShaderValue(
+				state.light_shader,
+				state.light_radius_loc,
+				&state.light_radius,
+				.FLOAT,
+			)
+			rl.SetShaderValue(state.light_shader, state.render_size_loc, &render_size, .VEC2)
+
+			// Draw a full-screen rectangle that will be affected by our shader
+			// rl.DrawRectangle(0, 0, GAME_WIDTH, GAME_HEIGHT, rl.WHITE)
+			rl.DrawRectangleRec(
+				rl.Rectangle{0, 0, f32(rl.GetScreenWidth()), f32(rl.GetScreenHeight())},
+				rl.WHITE,
+			)
+			//rl.DrawRectangle(0, 0, GAME_WIDTH, GAME_HEIGHT, rl.WHITE)
+
+			//Draw firepit glows (additive blending)
+			rl.BeginBlendMode(.ADDITIVE)
+			for firepit in state.firepits {
+				if firepit.fire_active {
+					// Simple glow effect
+					glow_pos := rl.Vector2 {
+						(firepit.position.x - state.camera.target.x) +
+						(f32(rl.GetScreenWidth()) * 0.5),
+						(firepit.position.y - state.camera.target.y) +
+						(f32(rl.GetScreenHeight()) * 0.5),
+					}
+					rl.DrawCircleV(glow_pos, 50.0, rl.ColorAlpha(rl.ORANGE, 0.3))
+					rl.DrawCircleV(glow_pos, 30.0, rl.ColorAlpha(rl.YELLOW, 0.5))
+				}
+			}
+			rl.EndBlendMode()
+			// Simple glow effect
+			rl.BeginBlendMode(.ADDITIVE)
+			rl.DrawCircleV(
+				state.player.position,
+				50.0, // Glow radius
+				rl.ColorAlpha(rl.ORANGE, 0.3),
+			)
+			rl.DrawCircleV(screen_pos, 30.0, rl.ColorAlpha(rl.YELLOW, 0.5))
+			rl.EndBlendMode()
+		}
+		rl.EndShaderMode()
+		rl.BeginBlendMode(.MULTIPLIED)
 		rl.DrawTexturePro(
 			state.render_texture.texture,
 			rl.Rectangle{0, 0, GAME_WIDTH, -GAME_HEIGHT}, // Flip Y
@@ -685,6 +877,7 @@ draw_game :: proc() {
 			0,
 			rl.WHITE,
 		)
+		rl.EndBlendMode()
 	}
 	rl.EndDrawing()
 }
@@ -758,4 +951,138 @@ is_tile_blocking :: proc(pos: rl.Vector2) -> bool {
 		}
 	}
 	return false
+}
+update_firepits :: proc() {
+	state.nearest_firepit_index = -1 // Reset each frame
+	state.show_firepit_prompt = false
+
+	// Find the nearest interactable firepit
+	closest_distance: f32 = max(f32) // Initialize with max possible distance
+	for fp, i in state.firepits {
+		distance := rl.Vector2Distance(state.player.position, fp.position)
+		activation_radius := f32(state.tile_width * 1)
+
+		if distance <= activation_radius && fp.animationPlayer.state == .DEACTIVE {
+			if distance < closest_distance {
+				closest_distance = distance
+				state.nearest_firepit_index = i
+			}
+		}
+	}
+
+	// Show prompt for nearest firepit
+	if state.nearest_firepit_index != -1 {
+		fp := &state.firepits[state.nearest_firepit_index]
+		fp.show_interact_prompt = true
+		state.show_firepit_prompt = true
+
+		// Activate specific firepit on E press
+		if rl.IsKeyPressed(.E) {
+			fp.animationPlayer.state = .ACTIVE
+			fp.animationPlayer.frame_count = 5
+			fp.animationPlayer.frame = 1 // Skip first frame
+			fp.fire_active = true
+			//play_sound("fire_ignite")
+
+			// Optional light boost
+			//state.light_timer = min(state.light_timer + 20, state.light_duration)
+		}
+	}
+
+	// Update animations for all active firepits
+	for &fp in state.firepits {
+		if fp.animationPlayer.state == .ACTIVE {
+			fp.animationPlayer.timer += rl.GetFrameTime()
+			if fp.animationPlayer.timer >= fp.animationPlayer.frame_duration {
+				fp.animationPlayer.timer = 0
+				fp.animationPlayer.frame =
+					(fp.animationPlayer.frame + 1) % fp.animationPlayer.frame_count
+
+				// Skip frame 0
+				if fp.animationPlayer.frame == 0 {
+					fp.animationPlayer.frame = 1
+				}
+			}
+		}
+	}
+}
+
+draw_firepits_tooltip :: proc() {
+	for fp in state.firepits {
+		// Draw firepit base
+		frame_row := 1 // Second row for firepit animations
+		frame_col := i32(fp.animationPlayer.frame) % (state.texture_efr.width / TILE_SIZE)
+		frame_x := f32(frame_col * TILE_SIZE)
+		frame_y := f32(frame_row * TILE_SIZE)
+
+		f_src := rl.Rectangle{frame_x, frame_y, f32(TILE_SIZE), f32(TILE_SIZE)}
+		rl.DrawTextureRec(state.texture_efr, f_src, fp.position, rl.WHITE)
+
+		// Draw effects if active
+		if fp.fire_active {
+			// Glow effect
+			rl.BeginBlendMode(.ADDITIVE)
+			glow_alpha := 0.5 + 0.2 * math.sin(rl.GetTime() * 3)
+			rl.DrawTextureRec(
+				state.texture_efr,
+				f_src,
+				fp.position,
+				rl.ColorAlpha(rl.ORANGE, f32(glow_alpha)),
+			)
+			rl.EndBlendMode()
+
+			// Light effect on environment
+			// if rl.CheckCollisionPointCircle(state.player.position, fp.position, 100) {
+			// 	state.light_radius = max(state.light_radius, 150) // Extend light radius
+			// }
+		}
+
+		// Draw interaction prompt
+		if fp.show_interact_prompt && !fp.fire_active {
+			text_pos := rl.Vector2{fp.position.x - 30, fp.position.y - 25}
+			rl.DrawTextEx(state.main_font, "[E] Light", text_pos, 14, 1, rl.WHITE)
+		}
+	}
+}
+check_firepit_interaction :: proc() {
+	if rl.IsKeyPressed(.R) {
+		for &firepit in state.firepits {
+			if rl.CheckCollisionCircles(
+				state.player.position,
+				30.0, // Interaction range
+				firepit.position,
+				f32(state.tile_width),
+			) {
+				// Reset light timer
+				state.light_timer = state.light_duration
+				state.light_radius = state.max_light_radius
+
+				// Visual feedback
+				firepit.fire_active = true
+				//play_sound("fire_relight")
+			}
+		}
+	}
+}
+update_light_decay :: proc(dt: f32) {
+	// Only decay if not near firepit
+	near_firepit := false
+	for firepit in state.firepits {
+		if firepit.fire_active &&
+		   rl.CheckCollisionCircles(
+			   state.player.position,
+			   state.light_radius,
+			   firepit.position,
+			   f32(state.tile_width * 2),
+		   ) {
+			near_firepit = true
+			break
+		}
+	}
+
+	if !near_firepit {
+		state.light_timer -= dt
+		if state.light_timer < 0 do state.light_timer = 0
+		state.light_radius = state.max_light_radius * (state.light_timer / state.light_duration)
+	}
 }
